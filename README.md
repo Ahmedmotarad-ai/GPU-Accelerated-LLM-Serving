@@ -122,6 +122,9 @@ GPU-Accelerated-LLM-Serving/
 ├── requirements-dev.txt # pytest (+ dev tools)
 ├── .env.example         # environment template (no secrets)
 ├── .gitignore           # excludes weights, caches, venvs, .env
+├── .dockerignore        # Docker build-context exclusions (weights, .git, caches)
+├── Dockerfile           # gateway/UI container image (never loads the model)
+├── docker-compose.yml   # vllm (GPU) + api + streamlit services
 ├── streamlit_app.py     # Streamlit frontend
 └── README.md
 ```
@@ -327,7 +330,155 @@ pytest -q tests/test_api.py
 Expected: `12 passed`. The vLLM client is mocked, so the suite runs on any
 machine without a GPU. GPU integration and benchmark runs require a T4 runtime.
 
-## 17. Troubleshooting
+## 17. Docker Deployment
+
+Three-container deployment. The `vllm` service requires an NVIDIA GPU; `api`
+and `streamlit` are lightweight CPU containers.
+
+```text
+docker-compose
+   ├── vllm      (vllm/vllm-openai, NVIDIA GPU, host :9033)
+   ├── api       (FastAPI gateway, host :8000)
+   └── streamlit (host :8501)
+
+streamlit http://localhost:8501
+      |  API_BASE_URL=http://api:8000
+      v
+api http://localhost:8000  (/health /generate /metrics)
+      |  VLLM_BASE_URL=http://vllm:8000
+      v
+vllm http://localhost:9033  (internal :8000 -> host :9033)
+      |  GPU via deploy.resources.reservations.devices
+      v
+MiniCPM5-2B-GPTQ (AWQ 4-bit, downloaded from Hugging Face on first start)
+```
+
+Files:
+
+- `Dockerfile` — gateway/UI image (python:3.12-slim; installs only
+  `requirements-gui.txt`; **never loads a model**).
+- `docker-compose.yml` — `vllm`, `api`, `streamlit` services, health checks,
+  GPU reservation, `hf-cache` volume.
+- `.dockerignore` — keeps weights/caches/git/submodules out of the build
+  context.
+
+### Prerequisites
+
+1. Docker Engine with the Compose v2 plugin (`docker compose version`), or
+   Docker Desktop.
+2. NVIDIA driver (CUDA-capable) on the host.
+3. **NVIDIA Container Toolkit** (`nvidia-container-toolkit`) installed and
+   configured for the container runtime.
+4. GPU: NVIDIA Tesla T4 (16 GB) — the validated target for this stack.
+
+### Build and start
+
+```bash
+docker compose up --build -d
+```
+
+First startup downloads the model weights into the `hf-cache` volume
+(several GB) and loads them onto the GPU before vLLM starts serving.
+
+```bash
+docker compose logs -f vllm      # model download + engine init
+docker compose ps                # service health
+```
+
+### Stop
+
+```bash
+docker compose down              # stop containers (keep hf-cache volume)
+docker compose down --volumes    # also delete the cached model weights
+```
+
+### URLs after startup
+
+| Service    | URL                                       |
+| ---------- | ----------------------------------------- |
+| vLLM API   | http://localhost:9033/v1/models           |
+| FastAPI    | http://localhost:8000/health              |
+| Streamlit  | http://localhost:8501                     |
+
+### GPU requirement
+
+The vLLM service does not run without GPU access. It is reserved in compose:
+
+```yaml
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+```
+
+If the NVIDIA Container Toolkit is missing or misconfigured, the `vllm`
+container crashes on startup (see Docker Troubleshooting below).
+
+### Model download / cache behavior
+
+- Weights are **not** in the repository. `openbmb/MiniCPM5-2B-GPTQ` is pulled
+  from Hugging Face into the named volume `hf-cache`
+  (`HF_HOME=/root/.cache/huggingface`) on first start.
+- For gated models, create a local `.env` with `HF_TOKEN=hf_...` (never
+  committed; `.env` is gitignored). Compose passes it to the `vllm` service.
+- Reset the cache: `docker compose down --volumes`, then `docker compose up -d`.
+
+### Configuration (compose interpolation via `.env`)
+
+| Variable             | Default                                   |
+| -------------------- | ----------------------------------------- |
+| `VLLM_IMAGE`         | `vllm/vllm-openai:v0.24.0`                |
+| `MODEL_ID`           | `openbmb/MiniCPM5-2B-GPTQ`                |
+| `SERVED_MODEL_NAME`  | `openbmb/MiniCPM5-2B-GPTQ`                |
+| `VLLM_GPU_MEM_UTIL`  | `0.30`                                    |
+| `VLLM_MAX_MODEL_LEN` | `512`                                     |
+| `VLLM_TIMEOUT`       | `120`                                     |
+| `REQUEST_TIMEOUT`    | `120`                                     |
+| `HF_TOKEN`           | (unset)                                   |
+
+The AWQ runtime configuration is preserved end-to-end: `--quantization awq
+--dtype float16 --enforce-eager`, with the pinned model id and served model
+name (see sections 8 and 11).
+
+### Example inference request
+
+```bash
+curl -s http://localhost:8000/generate \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Explain GPU quantization in simple terms.", "max_tokens": 256, "temperature": 0.2}'
+```
+
+### FlagOS / FlagGems note
+
+The Docker vLLM service uses the upstream `vllm/vllm-openai` image, which
+includes the AWQ/Marlin path. The **FlagOS/FlagGems plugin stack is not
+embedded in the container image**; it is built and run bare-metal via
+`scripts/` (sections 5, 9 and 10). A containerized FlagOS variant would
+require a custom vLLM image and T4 validation — tracked as future work.
+
+### Docker Troubleshooting
+
+| Symptom                              | Cause / fix                                                   |
+| ------------------------------------ | ------------------------------------------------------------- |
+| `vllm` container exits immediately   | No GPU access. Verify toolkit: `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` |
+| Model never finishes loading         | First run downloads weights; check `docker compose logs -f vllm` and the `hf-cache` volume size |
+| 503/502 from `api` (vllm unhealthy)  | Wait for model load (`start_period` is 300 s)                 |
+| Image pull fails for the default tag | `VLLM_IMAGE` must match an existing upstream `vllm/vllm-openai` tag for your vLLM version |
+| OOM on GPU                           | Lower `VLLM_GPU_MEM_UTIL` (0.30 fits the 2B AWQ on a 16 GB T4) |
+
+### Verification status
+
+- **Locally verified:** `docker compose config` parses; `Dockerfile`,
+  `docker-compose.yml`, `.dockerignore` present; gateway unit tests pass.
+- **Environment-dependent (not yet executed here):** image pull/build, vLLM GPU
+  load, `/health` + `/generate` end-to-end, Streamlit availability, GPU
+  visibility inside the vllm container. These require a Docker host with the
+  NVIDIA Container Toolkit and a Tesla T4.
+
+## 18. Troubleshooting
 
 | Symptom                          | Cause / fix                                                     |
 | -------------------------------- | --------------------------------------------------------------- |
@@ -339,7 +490,7 @@ machine without a GPU. GPU integration and benchmark runs require a T4 runtime.
 | Missing `vllm_fl` / `flag_gems`   | Re-run `scripts/setup_plugin.sh` (submodules must be checked out) |
 | Submodule directory empty         | Clone with `--recurse-submodules` or run `git submodule update --init --recursive` |
 
-## 18. Reproducibility
+## 19. Reproducibility
 
 1. Clone with submodules:
    ```bash
@@ -359,8 +510,12 @@ vllm-plugin-FL https://github.com/flagos-ai/vllm-plugin-FL @ fd5c727
 
 ## Not Yet Implemented (future phases)
 
-- **Docker** containerization for the GPU (CUDA → vLLM → FlagOS) and the
-  gateway/UI tiers. Not built yet; T4 validation required before authoring.
+- **Docker GPU validation**: the Docker files are implemented and
+  configuration-validated, but an end-to-end container run on an NVIDIA
+  Tesla T4 host still needs to be executed (see section 17).
+- **Custom FlagOS vLLM image**: embedding the FlagOS/FlagGems plugin stack in
+  a Docker image (currently served by the upstream `vllm/vllm-openai`
+  container).
 - **Re-created Colab notebook** (`notebooks/FlagOS_GPU_Inference.ipynb`). The
   original runtime notebook was lost; a fresh notebook with real execution
   output should be generated on a new T4 runtime.

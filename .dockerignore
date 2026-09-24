@@ -1,0 +1,56 @@
+# Version control / submodules
+.git
+.gitmodules
+.gitattributes
+
+# Virtual environments
+.venv
+venv
+env
+
+# Python caches / build artifacts
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+*.egg-info
+build
+dist
+
+# Model weights (never shipped; downloaded from Hugging Face at runtime)
+models
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Secrets / env / logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Notebook / Colab scratch
+aa.ipynb
+.ipynb_checkpoints
+
+# Runtime caches (incl. Hugging Face cache snapshots)
+.cache
+
+# Upstream repos (git submodules; not needed in the app-image build context)
+FlagGems
+vllm-plugin-FL
+
+# Dev-only content not required by the app image
+benchmark_results
+scripts
+tests
+requirements-dev.txt
+
+# Docker files themselves (keep the build context lean)
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md

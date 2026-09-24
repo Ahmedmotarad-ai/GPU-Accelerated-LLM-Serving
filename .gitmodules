@@ -1,0 +1,6 @@
+[submodule "FlagGems"]
+	path = FlagGems
+	url = https://github.com/flagos-ai/FlagGems.git
+[submodule "vllm-plugin-FL"]
+	path = vllm-plugin-FL
+	url = https://github.com/flagos-ai/vllm-plugin-FL.git

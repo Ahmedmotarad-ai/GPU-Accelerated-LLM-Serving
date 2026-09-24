@@ -1,50 +1,159 @@
 # GPU-Accelerated LLM Inference Server
 
-Production-style LLM serving stack on **NVIDIA Tesla T4 (16 GB)**:
+Production-style LLM inference stack for **openbmb/MiniCPM5-2B** on a
+**NVIDIA Tesla T4**, combining **vLLM**, the **FlagOS** operator-dispatch
+plugin, **FlagGems** kernels, **AWQ 4-bit** quantization, and a
+**Streamlit → FastAPI → vLLM** serving pipeline.
 
-- **vLLM 0.24.0** — OpenAI-compatible inference engine
-- **FlagOS** + **FlagGems** — operator dispatch layers
-- **MiniCPM5-2B** — AWQ/GPTQ 4-bit quantized (MarlinLinearKernel)
-- **Triton attention backend** — compute capability 7.5 compatible
+## 1. Project Overview
 
-## Interactive Demo
+This repository demonstrates a full GPU LLM serving workflow:
 
-A minimal three-tier demo: **Streamlit → FastAPI → vLLM → GPU**.
+- Inference engine: **vLLM** (OpenAI-compatible API)
+- Operator/stencil acceleration: **FlagOS** (`vllm-plugin-FL`) + **FlagGems**
+- Quantized serving: **AWQ 4-bit** (`openbmb/MiniCPM5-2B-GPTQ`, Marlin kernel)
+- Serving layer: **FastAPI** gateway + **Streamlit** UI
+- Benchmarking: real Tesla T4 measurements (historical run, see section 13)
+
+## 2. Architecture
 
 ```text
-Streamlit (UI)
-     │  HTTP (API_BASE_URL)
-     ▼
-FastAPI (Gateway)          /health  /generate  /metrics
-     │  HTTP (VLLM_BASE_URL)
-     ▼
-vLLM OpenAI-compatible API (port 9033)
-     │
-     ▼
-MiniCPM5-2B AWQ 4-bit (Marlin)  →  NVIDIA T4
+Streamlit UI  (http://localhost:8501)
+     |  HTTP  (API_BASE_URL, default http://127.0.0.1:8000)
+     v
+FastAPI Gateway  (port 8000)   /health  /generate  /metrics
+     |  HTTP  (VLLM_BASE_URL, default http://127.0.0.1:9033)
+     v
+vLLM OpenAI-Compatible API  (port 9033)
+     |  FlagOS plugin dispatch -> FlagGems kernels
+     v
+MiniCPM5-2B (AWQ 4-bit, Marlin)  ->  NVIDIA Tesla T4 GPU
 ```
 
-**Why Streamlit does not call vLLM directly:**
+The gateway **never loads the model**. vLLM remains the sole inference engine.
+Streamlit communicates only with the gateway.
 
-- Separation of concerns: the UI is only a frontend, vLLM only serves inference.
-- The gateway owns request validation, latency/token metrics computation, and
-  graceful error mapping — so the UI never sees raw vLLM errors or stack traces.
-- One authoritative entry point for the model makes the stack easy to extend
-  (auth, observability, routing) without touching the inference server.
-- It mirrors how real inference platforms are deployed (client → gateway → engine).
+## 3. Target Hardware
 
-### 1. Start vLLM (Terminal 1)
+| Property              | Value                     |
+| --------------------- | ------------------------- |
+| GPU                   | NVIDIA Tesla T4          |
+| VRAM                  | 16 GB                    |
+| Compute capability    | 7.5                      |
+| CUDA                  | 13.0                     |
+| Driver                | 580.82.07                |
+
+The T4 cannot use FlashAttention 2; the tested configuration used the Triton
+attention path (see section 9).
+
+## 4. Software Stack
+
+Runtime versions verified on the original Colab T4 runtime:
+
+| Component      | Version / source                         |
+| -------------- | ---------------------------------------- |
+| Python         | 3.12.3                                   |
+| PyTorch        | 2.11.0+cu130                            |
+| vLLM           | 0.24.0                                   |
+| FlagOS plugin  | submodule `vllm-plugin-FL` @ `fd5c727`   |
+| FlagGems       | submodule `FlagGems` @ `f7c55cb`         |
+| Model (FP16)   | `openbmb/MiniCPM5-2B`                    |
+| Model (AWQ)    | `openbmb/MiniCPM5-2B-GPTQ`               |
+
+## 5. Installation
+
+### A. Inference runtime (GPU host / Colab T4)
 
 ```bash
-export VLLM_VENDOR=cuda
-export FLAGGEMS_VENDOR=nvidia
-export VLLM_PLUGINS=fl
-export VLLM_FL_PREFER=flagos
-export VLLM_FL_PREFER_ENABLED=True
-export VLLM_FL_USE_FLAGGEMS_ATTN=0
-export VLLM_FL_FLAGOS_WHITELIST=attention_backend
+git clone --recurse-submodules https://github.com/Ahmedmotarad-ai/GPU-Accelerated-LLM-Serving.git
+cd GPU-Accelerated-LLM-Serving
 
-python -m vllm serve openbmb/MiniCPM5-2B-GPTQ \
+# Optional venv (WSL / Linux)
+python3 -m venv ~/flagos-env && source ~/flagos-env/bin/activate
+
+# Base inference stack
+pip install --upgrade pip
+pip install "vllm==0.24.0"
+pip install "huggingface_hub>=0.26"
+
+# FlagOS plugin + FlagGems (editable installs from submodules)
+bash scripts/setup_plugin.sh
+
+# Verification
+python scripts/verify_plugin.py
+```
+
+### B. GUI / gateway (any machine, CPU-only)
+
+```bash
+pip install -r requirements-gui.txt
+```
+
+## 6. Repository Structure
+
+```text
+GPU-Accelerated-LLM-Serving/
+│
+├── api/
+│   ├── __init__.py
+│   ├── client.py        # httpx client -> vLLM OpenAI API
+│   ├── main.py          # FastAPI: /health /generate /metrics
+│   └── schemas.py       # Pydantic request/response validation
+│
+├── tests/
+│   └── test_api.py      # 12 gateway tests (mocked vLLM, no GPU)
+│
+├── scripts/
+│   ├── setup_wsl.sh     # venv + vllm==0.24.0 install (WSL/Linux)
+│   ├── setup_plugin.sh  # editable install of vllm-plugin-FL + FlagGems
+│   ├── download_model.py# HF snapshot download helper
+│   ├── smoke_minicpm5.py# BnB smoke path (experiment; see note in file)
+│   ├── verify_plugin.py # import checks: flag_gems, vllm_fl, vllm
+│   ├── test_cuda.py     # torch CUDA matmul check
+│   └── test_bnb.py      # bitsandbytes linear4bit check
+│
+├── benchmark_results/
+│   └── README.md        # historical T4 results + methodology (provenance)
+│
+├── FlagGems/            # git submodule (@ f7c55cb, flagos-ai/FlagGems)
+├── vllm-plugin-FL/      # git submodule (@ fd5c727, flagos-ai/vllm-plugin-FL)
+│
+├── requirements-gui.txt # FastAPI + Streamlit deps only
+├── requirements-dev.txt # pytest (+ dev tools)
+├── .env.example         # environment template (no secrets)
+├── .gitignore           # excludes weights, caches, venvs, .env
+├── streamlit_app.py     # Streamlit frontend
+└── README.md
+```
+
+`models/` holds downloaded weights and is intentionally untracked (see model
+setup). Submodule checkouts are cloned with `--recurse-submodules`.
+
+## 7. Model Setup
+
+Weights are **downloaded from Hugging Face**; they are never committed.
+
+```bash
+# FP16 checkpoint (needed only for non-quantized serving / smoke tests)
+python scripts/download_model.py \
+  --repo openbmb/MiniCPM5-2B \
+  --local-dir models/openbmb/MiniCPM5-2B
+
+# AWQ 4-bit checkpoint (primary serving path)
+python scripts/download_model.py \
+  --repo openbmb/MiniCPM5-2B-GPTQ \
+  --local-dir models/openbmb/MiniCPM5-2B-GPTQ
+```
+
+vLLM can also load directly from the HF hub by model id, or from the HF cache
+snapshot path.
+
+## 8. vLLM Serving
+
+Start the OpenAI-compatible server on `:9033`:
+
+```bash
+vllm serve openbmb/MiniCPM5-2B-GPTQ \
   --quantization awq \
   --dtype float16 \
   --gpu-memory-utilization 0.30 \
@@ -53,40 +162,130 @@ python -m vllm serve openbmb/MiniCPM5-2B-GPTQ \
   --port 9033
 ```
 
-### 2. Start the FastAPI gateway (Terminal 2)
+Smoke test:
+
+```bash
+curl http://127.0.0.1:9033/v1/models
+```
+
+Expected log markers (T4 runtime): `Using MarlinLinearKernel for
+AutoAWQMarlinLinearMethod`, quantization `auto_awq`, and the FlagOS
+attention backend active (`Op 'attention_backend' using 'default.flagos'`).
+
+## 9. FlagOS Configuration
+
+These environment variables are the verified Tesla T4 FlagOS configuration
+(inject them before launching vLLM):
+
+```bash
+export VLLM_VENDOR=cuda
+export FLAGGEMS_VENDOR=nvidia
+export VLLM_PLUGINS=fl
+export VLLM_FL_PREFER=flagos
+export VLLM_FL_PREFER_ENABLED=True
+export VLLM_FL_USE_FLAGGEMS_ATTN=0
+export VLLM_FL_FLAGOS_WHITELIST="attention_backend"
+```
+
+- `VLLM_FL_USE_FLAGGEMS_ATTN=0` keeps the attention backend on the Triton/
+  vLLM path. The **T4 is compute capability 7.5 and cannot use FlashAttention 2**;
+  the tested configuration therefore used the Triton attention backend.
+- `VLLM_FL_FLAGOS_WHITELIST` selects which operators FlagOS dispatches.
+
+### SiLU experiment
+
+To route SiLU+GELU through FlagOS as well (the tested SiLU configuration):
+
+```bash
+export VLLM_FL_FLAGOS_WHITELIST="silu_and_mul,attention_backend"
+```
+
+## 10. FlagGems Integration
+
+`FlagGems` provides the GPU kernel library used by the FlagOS plugin. It is
+pinned as a git submodule (`flagos-ai/FlagGems` @ `f7c55cb`) and installed
+editable:
+
+```bash
+bash scripts/setup_plugin.sh   # pip install --no-build-isolation -e ./FlagGems
+python -c "import flag_gems; print('flag_gems OK')"
+```
+
+## 11. Quantization
+
+The served checkpoint is `openbmb/MiniCPM5-2B-GPTQ`. Although the Hugging Face
+repository name contains **GPTQ**, vLLM consumes the checkpoint through its
+**AWQ** runtime path:
+
+| Property            | Value         |
+| ------------------- | ------------- |
+| quant_method        | awq           |
+| bits                | 4             |
+| group_size          | 128           |
+| zero_point          | true          |
+| desc_act           | false         |
+| checkpoint_format   | gemm          |
+| vLLM kernel         | Marlin (`MarlinLinearKernel`) |
+
+The runtime/benchmark configuration is therefore described as
+**AWQ 4-bit (Marlin)** inference, not generic GPTQ inference.
+
+## 12. Benchmark Methodology
+
+- Workload: 1024 input / 1024 output tokens, concurrency 1, 4 prompts
+  (`--test-cases '[[1024,1024,1,4]]'`).
+- Metrics: TTFT (time to first token), TPOT (time per output token),
+  aggregate output token/s.
+- Tool: `vllm-plugin-FL/benchmarks/benchmark_throughput_serve.py` against the
+  vLLM endpoint (`--port 9033 --served-model-name openbmb/MiniCPM5-2B-GPTQ`).
+
+```bash
+python vllm-plugin-FL/benchmarks/benchmark_throughput_serve.py \
+  --model "<path to local checkpoint or HF cache snapshot>" \
+  --port 9033 \
+  --served-model-name openbmb/MiniCPM5-2B-GPTQ \
+  --test-cases '[[1024,1024,1,4]]'
+```
+
+Run this **after** the vLLM server (section 8) is up. Results are written under
+`vllm-plugin-FL/benchmark_results/`.
+
+## 13. Historical T4 Benchmark Results
+
+Measured on a live Colab Tesla T4 during the original runtime. The raw CSV
+artifacts were lost when that runtime expired; the numbers below are preserved
+as historical measurements (see `benchmark_results/README.md`).
+
+| Configuration            | Total tok/s | Output tok/s | TTFT      | TPOT      |
+| ------------------------ | ----------: | -----------: | --------: | --------: |
+| vLLM FP16 baseline       |       50.28 |        25.14 |  92.35 ms |   39.8 ms |
+| FlagOS + SiLU            |       26.25 |       ~13.13 | 174.04 ms | ~76.1 ms  |
+| FlagOS without SiLU      |       31.93 |       ~15.97 | 141.62 ms | ~62.4 ms  |
+| AWQ 4-bit + FlagOS       |       27.61 |       ~13.81 | 171.93 ms | ~72 ms    |
+
+> In the tested Tesla T4 configuration, the FlagOS-based configurations
+> measured lower throughput than the baseline vLLM FP16 configuration.
+
+This is a statement about these tested configurations on the Tesla T4, not a
+general claim about FlagOS performance.
+
+## 14. FastAPI Gateway
 
 ```bash
 python -m uvicorn api.main:app --host 0.0.0.0 --port 8000
 ```
 
-Optionally `export VLLM_BASE_URL=...` first (defaults to `http://127.0.0.1:9033`).
-
-### 3. Start Streamlit (Terminal 3)
-
-```bash
-python -m streamlit run streamlit_app.py --server.port 8501
-```
-
-Optionally `export API_BASE_URL=...` first (defaults to `http://127.0.0.1:8000`).
-Open http://localhost:8501.
-
-### API endpoints
-
-| Endpoint   | Method | Description                                              |
-| ---------- | ------ | -------------------------------------------------------- |
-| `/health`  | GET    | Gateway + vLLM reachability check                        |
-| `/generate`| POST   | Chat completion forwarded to vLLM with measured latency  |
-| `/metrics` | GET    | In-process counters (requests, tokens generated, uptime) |
-
-Example request:
+| Endpoint    | Method | Description                                     |
+| ----------- | ------ | ----------------------------------------------- |
+| `/health`   | GET    | Gateway + downstream vLLM reachability          |
+| `/generate` | POST   | Chat completion via vLLM with measured latency  |
+| `/metrics`  | GET    | In-process counters (requests, tokens, uptime)  |
 
 ```bash
 curl -s http://127.0.0.1:8000/generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Explain GPU quantization in simple terms.", "max_tokens": 256, "temperature": 0.2}'
 ```
-
-Example response:
 
 ```json
 {
@@ -98,53 +297,71 @@ Example response:
 }
 ```
 
-### Environment variables
+Environment variables (see `.env.example`):
 
-| Variable          | Default                       | Used by         |
-| ----------------- | ----------------------------- | --------------- |
-| `VLLM_BASE_URL`   | `http://127.0.0.1:9033`       | FastAPI gateway |
-| `VLLM_MODEL_NAME` | `openbmb/MiniCPM5-2B-GPTQ`    | FastAPI gateway |
-| `VLLM_TIMEOUT`    | `120`                         | FastAPI gateway |
-| `API_BASE_URL`    | `http://127.0.0.1:8000`       | Streamlit       |
-| `REQUEST_TIMEOUT` | `120`                         | Streamlit       |
+| Variable          | Default                    | Used by         |
+| ----------------- | -------------------------- | --------------- |
+| `VLLM_BASE_URL`   | `http://127.0.0.1:9033`    | FastAPI gateway |
+| `VLLM_MODEL_NAME` | `openbmb/MiniCPM5-2B-GPTQ` | FastAPI gateway |
+| `VLLM_TIMEOUT`    | `120`                      | FastAPI gateway |
+| `API_BASE_URL`    | `http://127.0.0.1:8000`    | Streamlit       |
+| `REQUEST_TIMEOUT` | `120`                      | Streamlit       |
 
-See `.env.example`.
-
-### Testing the gateway (no GPU required)
+## 15. Streamlit UI
 
 ```bash
-pip install -r requirements-gui.txt pytest
-python -m pytest tests/test_api.py -v
+python -m streamlit run streamlit_app.py --server.port 8501
 ```
 
-The downstream vLLM server is mocked, so the test suite does not need a GPU.
+Open http://localhost:8501. The UI shows model connection status badges,
+prompt/max-tokens/temperature controls, the generated response, and latency /
+output-tokens / tokens-per-second metrics.
 
-## Project Layout
+## 16. Testing
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q tests/test_api.py
+```
+
+Expected: `12 passed`. The vLLM client is mocked, so the suite runs on any
+machine without a GPU. GPU integration and benchmark runs require a T4 runtime.
+
+## 17. Troubleshooting
+
+| Symptom                          | Cause / fix                                                     |
+| -------------------------------- | --------------------------------------------------------------- |
+| `/generate` -> 503/502 from gateway | vLLM unreachable or upstream error; check vLLM logs             |
+| `/generate` -> 504                | Inference timeout; raise `VLLM_TIMEOUT`/`REQUEST_TIMEOUT`      |
+| vLLM won't start, FlashAttention error | T4 is CC 7.5; migration path requires Triton attention (use verified env vars, section 9) |
+| Benchmark `--model` path missing  | Pass the local checkpoint dir or the HF cache snapshot path     |
+| CUDA OOM during load              | Keep `--gpu-memory-utilization` low (0.30 verified for 2B AWQ)  |
+| Missing `vllm_fl` / `flag_gems`   | Re-run `scripts/setup_plugin.sh` (submodules must be checked out) |
+| Submodule directory empty         | Clone with `--recurse-submodules` or run `git submodule update --init --recursive` |
+
+## 18. Reproducibility
+
+1. Clone with submodules:
+   ```bash
+   git clone --recurse-submodules https://github.com/Ahmedmotarad-ai/GPU-Accelerated-LLM-Serving.git
+   ```
+2. Reproduce the vLLM 0.24 + PyTorch 2.11 + CUDA 13 environment (section 5).
+3. Download model checkpoints (section 7).
+4. Export the FlagOS environment (section 9) and serve (section 8).
+5. Run the gateway and UI (sections 14-15).
+
+Pinned upstream dependencies:
 
 ```text
-api/                    FastAPI gateway (schemas, client, main)
-streamlit_app.py        Streamlit frontend
-tests/test_api.py       Gateway API tests (mocked vLLM)
-requirements-gui.txt    GUI/gateway dependencies only
-.env.example            Configuration template
-vllm-plugin-FL/         FlagOS plugin + benchmark scripts
-FlagGems/               FlagGems kernel library
-scripts/                Setup/smoke utilities
-models/                 Local model checkpoints
+FlagGems      https://github.com/flagos-ai/FlagGems        @ f7c55cb
+vllm-plugin-FL https://github.com/flagos-ai/vllm-plugin-FL @ fd5c727
 ```
 
-## Benchmarking
+## Not Yet Implemented (future phases)
 
-The existing benchmark workflow is unchanged and lives under
-`vllm-plugin-FL/benchmarks/`:
-
-```bash
-python vllm-plugin-FL/benchmarks/benchmark_throughput_serve.py \
-  --model "<local model dir>" \
-  --port 9033 \
-  --served-model-name openbmb/MiniCPM5-2B-GPTQ \
-  --test-cases '[[1024,1024,1,4]]'
-```
-
-Run the benchmark script **after** the vLLM server is up; it writes
-`benchmark_results/raw_runs_*.csv` and `benchmark_results/summary_*.csv`.
+- **Docker** containerization for the GPU (CUDA → vLLM → FlagOS) and the
+  gateway/UI tiers. Not built yet; T4 validation required before authoring.
+- **Re-created Colab notebook** (`notebooks/FlagOS_GPU_Inference.ipynb`). The
+  original runtime notebook was lost; a fresh notebook with real execution
+  output should be generated on a new T4 runtime.
+- **Fresh benchmark run** to regenerate raw CSV artifacts.

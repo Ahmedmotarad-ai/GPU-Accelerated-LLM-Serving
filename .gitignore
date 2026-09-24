@@ -1,0 +1,50 @@
+# ---- Model weights (never commit; download from Hugging Face) ----
+/models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+venv*/
+
+# ---- Python caches / build artifacts ----
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# ---- Test / tool caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Scratch notebooks (junk/scratch only; real notebook lives in notebooks/) ----
+/aa.ipynb
+
+# ---- Hugging Face / model caches ----
+.cache/
+**/.cache/
+.cache/huggingface/
+**/.cache/huggingface/
+
+# ---- Runtime / Colab scratch ----
+.env
+*.log
+.ipynb_checkpoints/
+.colab-*
+sample_data/
+
+# ---- IDE / OS ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

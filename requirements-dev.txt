@@ -1,0 +1,4 @@
+# Development/test dependencies for this repository.
+# Runtime inference dependencies (vLLM, FlagOS, FlagGems) are installed via
+# the setup scripts and are intentionally not listed here.
+pytest>=8.0
